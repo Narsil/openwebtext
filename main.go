@@ -4,13 +4,15 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/gocolly/colly"
 	"github.com/gosimple/slug"
 )
 
@@ -22,10 +24,53 @@ func urlToFilename(url string) string {
 	return fmt.Sprintf("%s.txt", slug)
 }
 
+func visit(client *http.Client, url string, outdir string) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		fmt.Printf("R")
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36")
+	r, err := client.Do(req)
+	if e, ok := err.(net.Error); ok && e.Timeout() {
+		// This was a timeout
+		fmt.Printf("T")
+		return
+	} else if err != nil {
+		// This was an error, but not a timeout
+		fmt.Printf("F")
+		return
+	}
+	if r != nil {
+		defer r.Body.Close()
+	} else {
+		fmt.Printf("E")
+		return
+	}
+
+	if r.StatusCode >= 200 && r.StatusCode <= 299 {
+	} else if r.StatusCode == 404 {
+		fmt.Printf("4")
+	} else {
+		fmt.Printf("S")
+		return
+	}
+	filename := urlToFilename(url)
+	full_filename := fmt.Sprintf("%s/%s", outdir, filename)
+	out, err := os.Create(full_filename)
+	if err != nil {
+		fmt.Printf("C : %v\n", err)
+		return
+	}
+	defer out.Close()
+	io.Copy(out, r.Body)
+	fmt.Printf(".")
+}
+
 func main() {
 	flag.Parse()
 	args := flag.Args()
-	if len(args) != 1 {
+	if len(args) < 1 {
 		flag.Usage()
 		fmt.Printf("Command is incomplete please choose `download`\n")
 		os.Exit(1)
@@ -42,44 +87,27 @@ func main() {
 
 func download() {
 	fs := flag.NewFlagSet("Download", flag.ExitOnError)
-	maxOpenFiles := *fs.Int("max-open-files", 1000, "Don't open more files than this")
-	chunkSize := *fs.Int("chunk-size", 10000, "Attempt to download that many URLs every timeout seconds")
-	outdir := *fs.String("outdir", "scraped", "Output directory with all the files (will be huge)")
-	infile := *fs.String("infile", "urls.txt", "The file containing the URLs to parse")
-	timeout := time.Duration(*fs.Int("timeout", 30, "Timeout after which we move on next chunk."))
+	pmaxDownloads := fs.Int("max-concurrent-downloads", 20, "Don't open more coroutines/downloads than this")
+	poutdir := fs.String("outdir", "scraped", "Output directory with all the files (will be huge)")
+	pinfile := fs.String("infile", "urls.txt", "The file containing the URLs to parse")
+	pcheckfile := fs.String("checkfile", "check.txt", "The file containing which urls have been done")
+	ptimeout := fs.Int("timeout", 30, "Timeout after which we consider request failed")
 
-	openFiles := make(chan bool, maxOpenFiles)
+	fs.Parse(flag.Args()[1:])
 
-	for i := 0; i < maxOpenFiles; i++ {
-		openFiles <- true
+	maxDownloads := *pmaxDownloads
+	outdir := *poutdir
+	infile := *pinfile
+	checkfile := *pcheckfile
+	timeout := time.Duration(*ptimeout)
+
+	openCoroutines := make(chan bool, maxDownloads)
+
+	for i := 0; i < maxDownloads; i++ {
+		openCoroutines <- true
 	}
+
 	os.MkdirAll(outdir, 0755)
-	// Instantiate default collector
-	c := colly.NewCollector()
-	c.WithTransport(&http.Transport{
-		DisableKeepAlives: true,
-	})
-	c.SetRequestTimeout(timeout * time.Second)
-
-	c.OnScraped(func(r *colly.Response) {
-		if len(r.Body) == 0 {
-			fmt.Printf("X")
-			return
-		}
-		url := r.Request.URL.String()
-		filename := urlToFilename(url)
-		full_filename := fmt.Sprintf("%s/%s", outdir, filename)
-		b := <-openFiles
-		err := r.Save(full_filename)
-		if err != nil {
-			// log.Printf("Error creating file ...%s\n", err)
-			fmt.Printf("F")
-		} else {
-			fmt.Printf(".")
-		}
-		openFiles <- b
-
-	})
 
 	fileHandle, err := os.Open(infile)
 	if err != nil {
@@ -89,23 +117,61 @@ func download() {
 	fileScanner := bufio.NewScanner(fileHandle)
 
 	n := 0
+	f, err := os.Open(checkfile)
+	if err != nil {
+		// Can't read file
+	} else {
+		checkScanner := bufio.NewScanner(f)
+		for checkScanner.Scan() {
+			fileScanner.Scan()
+			url := strings.TrimSpace(fileScanner.Text())
+			checkUrl := strings.TrimSpace(checkScanner.Text())
+			n += 1
+			if url != checkUrl {
+				log.Fatalf("Check file seems to be corrupted %v != %v", url, checkUrl)
+			}
+		}
+	}
+	f.Close()
+	fmt.Printf("Skipped %v already checked urls", n)
+
+	f, err = os.OpenFile(checkfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Can't open %s : %v", checkfile, err)
+	}
+
+	tr := &http.Transport{
+		IdleConnTimeout: timeout * time.Second,
+	}
+	client := &http.Client{Transport: tr}
+
+	var wg sync.WaitGroup
+	i := 0
+	start := time.Now()
+	last := start
 	for fileScanner.Scan() {
-		// Add URLs to the queue
 		url := strings.TrimSpace(fileScanner.Text())
+		f.WriteString(fmt.Sprintf("%v\n", url))
 		full_filename := fmt.Sprintf("%s/%s", outdir, urlToFilename(url))
+		if i%1000 == 0 {
+			fmt.Printf("\nScanned %v urls in %v (total : %v)\n", i, time.Since(last), time.Since(start))
+			last = time.Now()
+		}
+		i += 1
 		if _, err := os.Stat(full_filename); err == nil {
 			// File exists
 		} else {
-			go c.Visit(url)
-		}
-		n += 1
-		if n >= chunkSize {
-			start := time.Now()
-			fmt.Printf("\nStarting %v files to download \n", n)
-			c.Wait()
-			n = 0
-			fmt.Printf("\n\tDONE in %s\n", time.Since(start))
+			wg.Add(1)
+			b := <-openCoroutines
+			go func() {
+				defer func() {
+					wg.Done()
+					openCoroutines <- b
+				}()
+
+				visit(client, url, outdir)
+			}()
 		}
 	}
-
+	wg.Wait()
 }
