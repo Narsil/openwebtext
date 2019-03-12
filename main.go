@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gosimple/slug"
+	"golang.org/x/net/html"
 )
 
 func urlToFilename(url string) string {
@@ -72,17 +73,139 @@ func main() {
 	args := flag.Args()
 	if len(args) < 1 {
 		flag.Usage()
-		fmt.Printf("Command is incomplete please choose `download`\n")
+		fmt.Printf("Command is incomplete please choose `download` or `extract`\n")
 		os.Exit(1)
 	}
 	command := args[0]
 	switch command {
 	case "download":
 		download()
+		return
+	case "extract":
+		extract()
+		return
 	default:
 		flag.Usage()
 		os.Exit(1)
 	}
+}
+
+func extract() {
+	fs := flag.NewFlagSet("Extract", flag.ExitOnError)
+	plistfile := fs.String("listfile", "list.txt", "A file that contains all filenames (faster than scanning the directory). You can run `ls -1 > list.txt` for instance ")
+	pdatadir := fs.String("datadir", "scraped", "Directory that contains the downloaded files")
+	poutdir := fs.String("outdir", "parsed", "Directory that will contained cleaned text")
+	pminLength := fs.Int("min-length", 100, "Minimum size of the strings to be captured")
+	fs.Parse(flag.Args()[1:])
+
+	listfile := *plistfile
+	datadir := *pdatadir
+	outdir := *poutdir
+	minLength := *pminLength
+
+	os.MkdirAll(outdir, 0755)
+
+	f, err := os.Open(listfile)
+	if err != nil {
+		log.Fatalf("Can't open list file %v, please check it exists", listfile)
+	}
+	defer f.Close()
+
+	fileScanner := bufio.NewScanner(f)
+
+	i := 0
+	start := time.Now()
+	last := start
+	for fileScanner.Scan() {
+		filename := strings.TrimSpace(fileScanner.Text())
+		parseFile(datadir, filename, minLength, outdir)
+		if i%1000 == 0 {
+			fmt.Printf("\nScanned %v urls in %v (total : %v)\n", i, time.Since(last), time.Since(start))
+			last = time.Now()
+		}
+		i += 1
+
+	}
+
+}
+
+func parseFile(datadir string, filename string, minLength int, outdir string) {
+	full_filename := fmt.Sprintf("%s/%s", datadir, filename)
+	htmlfile, err := os.Open(full_filename)
+	if err != nil {
+		fmt.Printf("Failed to open %v\n", full_filename)
+		return
+	}
+	defer htmlfile.Close()
+
+	var outstring strings.Builder
+
+	z := html.NewTokenizer(htmlfile)
+	inBody := false
+	inStyleScript := false
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			if z.Err() != io.EOF {
+				fmt.Printf("Error parsing %s\n", filename)
+			}
+			break
+		}
+		switch tt {
+		case html.StartTagToken:
+			tag, _ := z.TagName()
+			tagName := strings.ToLower(string(tag))
+			switch tagName {
+			case "body":
+				inBody = true
+			case "style":
+				fallthrough
+			case "script":
+				fallthrough
+			case "noscript":
+				inStyleScript = true
+				continue
+			default:
+				// fmt.Printf("Found reading %s, %s, %s\n", tagName, filename, z.Text())
+			}
+		case html.TextToken:
+			if inBody && !inStyleScript {
+				text := strings.TrimSpace(string(z.Text()))
+				if len(text) > minLength && !strings.Contains(text, "/") {
+					// fmt.Printf("%s\n", text)
+					outstring.WriteString(text)
+					outstring.WriteString("\n")
+				}
+			}
+		case html.EndTagToken:
+			tag, _ := z.TagName()
+			tagName := strings.ToLower(string(tag))
+			switch tagName {
+			case "body":
+				inBody = false
+			case "style":
+				fallthrough
+			case "script":
+				fallthrough
+			case "noscript":
+				inStyleScript = false
+				continue
+			}
+		}
+	}
+	if outstring.Len() == 0 {
+		// fmt.Printf("Ignored empty %v\n", filename)
+		return
+	}
+
+	outfilename := fmt.Sprintf("%s/%s", outdir, filename)
+	outfile, err := os.Create(outfilename)
+	if err != nil {
+		fmt.Printf("Failed to open %v\n", outfilename)
+		return
+	}
+	defer outfile.Close()
+	outfile.WriteString(outstring.String())
 }
 
 func download() {
