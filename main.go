@@ -92,15 +92,17 @@ func main() {
 
 func extract() {
 	fs := flag.NewFlagSet("Extract", flag.ExitOnError)
-	plistfile := fs.String("listfile", "list.txt", "A file that contains all filenames (faster than scanning the directory). You can run `ls -1 > list.txt` for instance ")
+	plistfile := fs.String("listfile", "scraped.txt", "A file that contains all filenames (faster than scanning the directory). You can run `ls -1 > list.txt` for instance ")
 	pdatadir := fs.String("datadir", "scraped", "Directory that contains the downloaded files")
 	poutdir := fs.String("outdir", "parsed", "Directory that will contained cleaned text")
+	poutfile := fs.String("outfile", "parsed.text", "A file the contains all filenames in `parsed` directory")
 	pminLength := fs.Int("min-length", 100, "Minimum size of the strings to be captured")
 	fs.Parse(flag.Args()[1:])
 
 	listfile := *plistfile
 	datadir := *pdatadir
 	outdir := *poutdir
+	outfile := *poutfile
 	minLength := *pminLength
 
 	os.MkdirAll(outdir, 0755)
@@ -116,9 +118,14 @@ func extract() {
 	i := 0
 	start := time.Now()
 	last := start
+	checkfile, err := os.Create(outfile)
+	if err != nil {
+		log.Fatalf("Can't open out file %v, please check it exists", listfile)
+	}
 	for fileScanner.Scan() {
 		filename := strings.TrimSpace(fileScanner.Text())
 		parseFile(datadir, filename, minLength, outdir)
+		checkfile.WriteString(fmt.Sprintf("%s\n", filename))
 		if i%1000 == 0 {
 			fmt.Printf("\nScanned %v urls in %v (total : %v)\n", i, time.Since(last), time.Since(start))
 			last = time.Now()
@@ -213,7 +220,7 @@ func download() {
 	pmaxDownloads := fs.Int("max-concurrent-downloads", 20, "Don't open more coroutines/downloads than this")
 	poutdir := fs.String("outdir", "scraped", "Output directory with all the files (will be huge)")
 	pinfile := fs.String("infile", "urls.txt", "The file containing the URLs to parse")
-	pcheckfile := fs.String("checkfile", "check.txt", "The file containing which urls have been done")
+	pcheckfile := fs.String("checkfile", "scraped.txt", "The file containing which urls have been done")
 	ptimeout := fs.Int("timeout", 30, "Timeout after which we consider request failed")
 
 	fs.Parse(flag.Args()[1:])
