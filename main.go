@@ -25,7 +25,7 @@ func urlToFilename(url string) string {
 	return fmt.Sprintf("%s.txt", slug)
 }
 
-func visit(client *http.Client, url string, outdir string) {
+func visit(client *http.Client, url string, outdir string, minLength int, parsedfile io.StringWriter) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		fmt.Printf("R")
@@ -60,11 +60,13 @@ func visit(client *http.Client, url string, outdir string) {
 	full_filename := fmt.Sprintf("%s/%s", outdir, filename)
 	out, err := os.Create(full_filename)
 	if err != nil {
-		fmt.Printf("C : %v\n", err)
+		fmt.Printf("C")
 		return
 	}
 	defer out.Close()
-	io.Copy(out, r.Body)
+	outstring := parse(r.Body, minLength)
+	parsedfile.WriteString(fmt.Sprintf("%s\n", filename))
+	out.WriteString(outstring)
 	fmt.Printf(".")
 }
 
@@ -73,7 +75,7 @@ func main() {
 	args := flag.Args()
 	if len(args) < 1 {
 		flag.Usage()
-		fmt.Printf("Command is incomplete please choose `download` or `extract`\n")
+		fmt.Printf("Command is incomplete please choose `download`\n")
 		os.Exit(1)
 	}
 	command := args[0]
@@ -81,80 +83,23 @@ func main() {
 	case "download":
 		download()
 		return
-	case "extract":
-		extract()
-		return
 	default:
 		flag.Usage()
 		os.Exit(1)
 	}
 }
 
-func extract() {
-	fs := flag.NewFlagSet("Extract", flag.ExitOnError)
-	plistfile := fs.String("listfile", "scraped.txt", "A file that contains all filenames (faster than scanning the directory). You can run `ls -1 > list.txt` for instance ")
-	pdatadir := fs.String("datadir", "scraped", "Directory that contains the downloaded files")
-	poutdir := fs.String("outdir", "parsed", "Directory that will contained cleaned text")
-	poutfile := fs.String("outfile", "parsed.text", "A file the contains all filenames in `parsed` directory")
-	pminLength := fs.Int("min-length", 100, "Minimum size of the strings to be captured")
-	fs.Parse(flag.Args()[1:])
-
-	listfile := *plistfile
-	datadir := *pdatadir
-	outdir := *poutdir
-	outfile := *poutfile
-	minLength := *pminLength
-
-	os.MkdirAll(outdir, 0755)
-
-	f, err := os.Open(listfile)
-	if err != nil {
-		log.Fatalf("Can't open list file %v, please check it exists", listfile)
-	}
-	defer f.Close()
-
-	fileScanner := bufio.NewScanner(f)
-
-	i := 0
-	start := time.Now()
-	last := start
-	checkfile, err := os.Create(outfile)
-	if err != nil {
-		log.Fatalf("Can't open out file %v, please check it exists", listfile)
-	}
-	for fileScanner.Scan() {
-		filename := strings.TrimSpace(fileScanner.Text())
-		parseFile(datadir, filename, minLength, outdir)
-		checkfile.WriteString(fmt.Sprintf("%s\n", filename))
-		if i%1000 == 0 {
-			fmt.Printf("\nScanned %v urls in %v (total : %v)\n", i, time.Since(last), time.Since(start))
-			last = time.Now()
-		}
-		i += 1
-
-	}
-
-}
-
-func parseFile(datadir string, filename string, minLength int, outdir string) {
-	full_filename := fmt.Sprintf("%s/%s", datadir, filename)
-	htmlfile, err := os.Open(full_filename)
-	if err != nil {
-		fmt.Printf("Failed to open %v\n", full_filename)
-		return
-	}
-	defer htmlfile.Close()
-
+func parse(file io.Reader, minLength int) string {
 	var outstring strings.Builder
 
-	z := html.NewTokenizer(htmlfile)
+	z := html.NewTokenizer(file)
 	inBody := false
 	inStyleScript := false
 	for {
 		tt := z.Next()
 		if tt == html.ErrorToken {
 			if z.Err() != io.EOF {
-				fmt.Printf("Error parsing %s\n", filename)
+				fmt.Printf("Error parsing\n")
 			}
 			break
 		}
@@ -201,27 +146,22 @@ func parseFile(datadir string, filename string, minLength int, outdir string) {
 		}
 	}
 	if outstring.Len() == 0 {
-		// fmt.Printf("Ignored empty %v\n", filename)
-		return
+		fmt.Printf("E")
+	} else {
+		fmt.Printf(".")
 	}
-
-	outfilename := fmt.Sprintf("%s/%s", outdir, filename)
-	outfile, err := os.Create(outfilename)
-	if err != nil {
-		fmt.Printf("Failed to open %v\n", outfilename)
-		return
-	}
-	defer outfile.Close()
-	outfile.WriteString(outstring.String())
+	return outstring.String()
 }
 
 func download() {
 	fs := flag.NewFlagSet("Download", flag.ExitOnError)
 	pmaxDownloads := fs.Int("max-concurrent-downloads", 20, "Don't open more coroutines/downloads than this")
-	poutdir := fs.String("outdir", "scraped", "Output directory with all the files (will be huge)")
+	poutdir := fs.String("outdir", "parsed", "Output directory with all the files (will be huge)")
 	pinfile := fs.String("infile", "urls.txt", "The file containing the URLs to parse")
 	pcheckfile := fs.String("checkfile", "scraped.txt", "The file containing which urls have been done")
+	pparsedfile := fs.String("parsedfile", "parsed.txt", "The file containing which urls have been extracted")
 	ptimeout := fs.Int("timeout", 30, "Timeout after which we consider request failed")
+	pminLength := fs.Int("min-length", 100, "Minimum length of text to be extracted (removes links and button nodes)")
 
 	fs.Parse(flag.Args()[1:])
 
@@ -229,7 +169,9 @@ func download() {
 	outdir := *poutdir
 	infile := *pinfile
 	checkfile := *pcheckfile
+	parsedfile := *pparsedfile
 	timeout := time.Duration(*ptimeout)
+	minLength := *pminLength
 
 	openCoroutines := make(chan bool, maxDownloads)
 
@@ -269,6 +211,10 @@ func download() {
 	if err != nil {
 		log.Fatalf("Can't open %s : %v", checkfile, err)
 	}
+	pf, err := os.OpenFile(parsedfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Can't open %s : %v", parsedfile, err)
+	}
 
 	tr := &http.Transport{
 		IdleConnTimeout: timeout * time.Second,
@@ -299,7 +245,7 @@ func download() {
 					openCoroutines <- b
 				}()
 
-				visit(client, url, outdir)
+				visit(client, url, outdir, minLength, pf)
 			}()
 		}
 	}
